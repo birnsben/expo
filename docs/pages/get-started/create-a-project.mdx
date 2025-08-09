@@ -1,24 +1,190 @@
----
-title: Create a project
-description: Learn how to create a new Expo project.
-hideTOC: true
----
+npx create-expo-app card-scanner
+cd card-scanner
+npm install expo-image-picker expo-file-system react-native-dotenv
+OPENAI_API_KEY=your_openai_key_here
+EBAY_APP_ID=your_ebay_app_id_here
+module.exports = function(api) {
+  api.cache(true);
+  return {
+    presets: ['babel-preset-expo'],
+    plugins: [
+      ['module:react-native-dotenv', {
+        "moduleName": "@env",
+        "path": ".env",
+      }]
+    ]
+  };
+};
+// App.js
 
-import { Terminal } from '~/ui/components/Snippet';
+import React, { useState } from 'react';
+import { View, Text, Button, Image, FlatList, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system';
+import { OPENAI_API_KEY, EBAY_APP_ID } from '@env';
 
-System requirements:
+// --- 1. AI Card Identifier ---
+const identifyCardWithAI = async (imageUri, detectedText) => {
+  try {
+    const base64Image = await FileSystem.readAsStringAsync(imageUri, { encoding: FileSystem.EncodingType.Base64 });
 
-- [Node.js (LTS)](https://nodejs.org/en/).
-- macOS, Windows (Powershell and [WSL 2](https://expo.fyi/wsl)), and Linux are supported.
+    const prompt = `
+    You are a card recognition expert. 
+    The following text was detected on the card: "${detectedText}".
+    Identify the exact card name and set for either Pokémon or any sports card.
+    Return only the card name and set, no extra text.
+    `;
 
-We recommend starting with the default project created by `create-expo-app`. The default project includes example code to help you get started.
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You are an assistant that identifies collectible cards." },
+          { role: "user", content: prompt }
+        ]
+      })
+    });
 
-To create a new project, run the following command:
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content?.trim();
+  } catch (err) {
+    console.error("AI Identification Error:", err);
+    return null;
+  }
+};
 
-<Terminal cmd={['$ npx create-expo-app@latest']} />
+// --- 2. eBay Price Fetcher ---
+const fetchCardPriceFromEbay = async (cardName) => {
+  try {
+    const endpoint = `https://svcs.ebay.com/services/search/FindingService/v1`;
+    const params = new URLSearchParams({
+      'OPERATION-NAME': 'findCompletedItems',
+      'SERVICE-VERSION': '1.0.0',
+      'SECURITY-APPNAME': EBAY_APP_ID,
+      'RESPONSE-DATA-FORMAT': 'JSON',
+      'REST-PAYLOAD': '',
+      'keywords': cardName,
+      'categoryId': '261328',
+      'sortOrder': 'EndTimeSoonest',
+      'itemFilter(0).name': 'SoldItemsOnly',
+      'itemFilter(0).value': 'true',
+      'itemFilter(1).name': 'Currency',
+      'itemFilter(1).value': 'USD',
+    });
 
-> You can choose a different template by adding the [`--template` option](/more/create-expo/#--template).
+    const url = `${endpoint}?${params.toString()}`;
+    const response = await fetch(url);
+    const data = await response.json();
 
-## Next step
+    const items = data.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    if (items.length === 0) return { averagePrice: 0, listings: [] };
 
-You have a project. Now it's time to set up your development environment so that you can start developing.
+    const prices = items.map(i => parseFloat(i.sellingStatus[0].currentPrice[0].__value__));
+    const avgPrice = prices.reduce((a, b) => a + b, 0) / prices.length;
+
+    return {
+      averagePrice: avgPrice.toFixed(2),
+      listings: items.map(i => ({
+        title: i.title[0],
+        price: i.sellingStatus[0].currentPrice[0].__value__,
+        url: i.viewItemURL[0]
+      }))
+    };
+
+  } catch (err) {
+    console.error("eBay Fetch Error:", err);
+    return { averagePrice: 0, listings: [] };
+  }
+};
+
+// --- 3. Main App Component ---
+export default function App() {
+  const [scanResult, setScanResult] = useState(null);
+  const [portfolio, setPortfolio] = useState([]);
+
+  const handleScan = async () => {
+    let result = await ImagePicker.launchCameraAsync({ quality: 1 });
+    if (result.canceled) return;
+
+    const imageUri = result.assets[0].uri;
+    const detectedText = "Card Text Placeholder"; // replace with OCR later
+
+    const aiCardInfo = await identifyCardWithAI(imageUri, detectedText);
+    if (!aiCardInfo) {
+      alert("Could not identify card");
+      return;
+    }
+
+    const priceData = await fetchCardPriceFromEbay(aiCardInfo);
+
+    setScanResult({
+      name: aiCardInfo,
+      averagePrice: priceData.averagePrice,
+      listings: priceData.listings,
+      image: imageUri
+    });
+  };
+
+  const saveToPortfolio = () => {
+    if (scanResult) {
+      setPortfolio([...portfolio, scanResult]);
+      alert("Saved to Portfolio!");
+    }
+  };
+
+  return (
+    <ScrollView style={styles.container}>
+      <Text style={styles.title}>Card Scanner App</Text>
+
+      <Button title="Scan Pokémon / Sports Card" onPress={handleScan} />
+
+      {scanResult && (
+        <View style={styles.card}>
+          <Image source={{ uri: scanResult.image }} style={styles.image} />
+          <Text style={styles.cardName}>{scanResult.name}</Text>
+          <Text>Avg Price (USD): ${scanResult.averagePrice}</Text>
+          <Button title="Save to Portfolio" onPress={saveToPortfolio} />
+          <Text style={styles.listingTitle}>Recent Sales:</Text>
+          {scanResult.listings.map((l, idx) => (
+            <Text key={idx} style={styles.listingItem}>
+              ${l.price} - {l.title}
+            </Text>
+          ))}
+        </View>
+      )}
+
+      <Text style={styles.sectionTitle}>Portfolio</Text>
+      {portfolio.length > 0 ? (
+        portfolio.map((p, idx) => (
+          <View key={idx} style={styles.portfolioItem}>
+            <Image source={{ uri: p.image }} style={styles.imageSmall} />
+            <View>
+              <Text>{p.name}</Text>
+              <Text>${p.averagePrice}</Text>
+            </View>
+          </View>
+        ))
+      ) : (
+        <Text>No cards saved yet.</Text>
+      )}
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { padding: 20, marginTop: 40 },
+  title: { fontSize: 24, fontWeight: 'bold', marginBottom: 20 },
+  card: { padding: 10, borderWidth: 1, marginTop: 20 },
+  image: { width: '100%', height: 200, resizeMode: 'contain' },
+  cardName: { fontSize: 18, fontWeight: 'bold', marginTop: 10 },
+  listingTitle: { marginTop: 10, fontWeight: 'bold' },
+  listingItem: { fontSize: 14 },
+  sectionTitle: { fontSize: 20, fontWeight: 'bold', marginTop: 30 },
+  portfolioItem: { flexDirection: 'row', alignItems: 'center', marginVertical: 5 },
+  imageSmall: { width: 50, height: 50, marginRight: 10 }
+});
